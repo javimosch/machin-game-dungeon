@@ -1,0 +1,488 @@
+// machin-game-dungeon — a first-person 3D dungeon crawler
+// Built in MFL through raylib's C FFI. Single native binary, zero deps.
+//
+// A Daggerfall-style prototype: procedural dungeon, first-person movement,
+// mouse look, colored 3D walls, HUD overlay.
+//
+// Controls:
+//   W/S     — forward/backward
+//   A/D     — strafe left/right
+//   Mouse   — look around (move mouse horizontally)
+//   ESC     — release mouse cursor
+//   Q       — quit
+//
+// Build: ./build.sh && ./machin-game-dungeon
+
+// ═══════════════════════════════════════════════════════════════
+// RAYLIB FFI — extern declarations
+// ═══════════════════════════════════════════════════════════════
+
+extern "raylib" {
+    header "raylib.h"
+    link "raylib" link "GL" link "m" link "pthread" link "dl" link "rt" link "X11"
+
+    // ── cstructs ──
+    cstruct Color       { r u8 g u8 b u8 a u8 }
+    cstruct Vector2     { x f32 y f32 }
+    cstruct Vector3     { x f32 y f32 z f32 }
+    cstruct Camera3D    { position Vector3 target Vector3 up Vector3 fovy f32 projection i32 }
+    cstruct Rectangle   { x f32 y f32 width f32 height f32 }
+
+    // ── window ──
+    fn InitWindow(i32, i32, string)
+    fn SetTargetFPS(i32)
+    fn WindowShouldClose() bool
+    fn CloseWindow()
+
+    // ── frame ──
+    fn BeginDrawing()
+    fn EndDrawing()
+    fn ClearBackground(Color)
+
+    // ── 3D ──
+    fn BeginMode3D(Camera3D)
+    fn EndMode3D()
+    fn DrawCube(Vector3, f32, f32, f32, Color)
+    fn DrawGrid(i32, f32)
+
+    // ── input ──
+    fn IsKeyDown(i32) bool
+    fn IsMouseButtonPressed(i32) bool
+    fn IsMouseButtonDown(i32) bool
+    fn GetMouseDelta() Vector2
+    fn DisableCursor()
+    fn EnableCursor()
+    fn IsCursorHidden() bool
+
+    // ── time ──
+    fn GetFrameTime() float
+
+    // ── 2D overlay ──
+    fn DrawText(string, i32, i32, i32, Color)
+    fn DrawRectangle(i32, i32, i32, i32, Color)
+    fn DrawFPS(i32, i32)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════
+
+var _MAP_W = 24
+var _MAP_H = 24
+
+// Tile types
+var _TILE_FLOOR = 0
+var _TILE_WALL  = 1
+var _TILE_DOOR  = 2
+
+// Colors (R, G, B, A)
+var _COL_STONE   = Color{100, 95, 90, 255}   // wall
+var _COL_FLOOR   = Color{45, 40, 35, 255}     // floor
+var _COL_CEILING = Color{25, 22, 20, 255}     // ceiling
+var _COL_DOOR    = Color{130, 95, 55, 255}    // wooden door
+var _COL_HP_BG   = Color{60, 60, 60, 255}     // HP bar background
+var _COL_HP_FG   = Color{200, 40, 40, 255}    // HP bar fill
+var _COL_WHITE   = Color{255, 255, 255, 255}
+var _COL_GRAY    = Color{180, 180, 180, 255}
+
+// ═══════════════════════════════════════════════════════════════
+// GAME STATE
+// ═══════════════════════════════════════════════════════════════
+
+var _map = []int{}
+
+// Player
+var _px = 2.5
+var _py = 2.5
+var _pangle = 0.0  // radians
+var _php = 20
+var _pmaxhp = 20
+var _pgold = 0
+
+// Mouse
+var _mouse_captured = 1
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITY
+// ═══════════════════════════════════════════════════════════════
+
+func idx(x, y) (i) { i = y * _MAP_W + x }
+
+func tile_at(x, y) (v) {
+    v = 1  // wall by default (out of bounds)
+    ix := int(x)
+    iy := int(y)
+    if ix >= 0 && ix < _MAP_W && iy >= 0 && iy < _MAP_H {
+        v = _map[idx(ix, iy)]
+    }
+}
+
+func col(r, g, b) (c) { c = Color{r, g, b, 255} }
+
+func v3(x, y, z) (v) { v = Vector3{x, y, z} }
+
+// ═══════════════════════════════════════════════════════════════
+// DUNGEON GENERATION (BSP)
+// ═══════════════════════════════════════════════════════════════
+
+type Room struct {
+    x int
+    y int
+    w int
+    h int
+}
+
+var _rooms = []Room{}
+var _player_spawned = 0
+
+func gen_dungeon() {
+    // Reset
+    _map = []int{}
+    _rooms = []Room{}
+    _player_spawned = 0
+
+    // Fill with walls
+    total := _MAP_W * _MAP_H
+    i := 0
+    while i < total {
+        _map = append(_map, _TILE_WALL)
+        i = i + 1
+    }
+
+    // Generate rooms
+    max_rooms := 7
+    attempts := 0
+    while attempts < 60 && len(_rooms) < max_rooms {
+        rw := rand_range(4, 8)
+        rh := rand_range(3, 6)
+        rx := rand_range(1, _MAP_W - rw - 1)
+        ry := rand_range(1, _MAP_H - rh - 1)
+
+        nr := Room{x: rx, y: ry, w: rw, h: rh}
+        overlap := false
+        j := 0
+        while j < len(_rooms) {
+            if rooms_overlap(nr, _rooms[j]) {
+                overlap = true
+            }
+            j = j + 1
+        }
+
+        if overlap == false {
+            carve_room(nr)
+            _rooms = append(_rooms, nr)
+        }
+        attempts = attempts + 1
+    }
+
+    // Connect rooms
+    j := 1
+    while j < len(_rooms) {
+        connect_rooms(_rooms[j-1], _rooms[j])
+        j = j + 1
+    }
+
+    // Place player in first room
+    if len(_rooms) > 0 {
+        r := _rooms[0]
+        _px = float(r.x + r.w / 2) + 0.5
+        _py = float(r.y + r.h / 2) + 0.5
+        _pangle = 0.0
+    }
+}
+
+func rand_range(min, max) (v) {
+    if max <= min { v = min; return }
+    r := rand_bytes(1)
+    b := byte_at(r, 0)
+    if b < 0 { b = -b }
+    v = b % (max - min) + min
+}
+
+func rooms_overlap(a, b) (v) {
+    v = true
+    if a.x + a.w <= b.x { v = false }
+    if b.x + b.w <= a.x { v = false }
+    if a.y + a.h <= b.y { v = false }
+    if b.y + b.h <= a.y { v = false }
+}
+
+func carve_room(r) {
+    y := r.y
+    while y < r.y + r.h {
+        x := r.x
+        while x < r.x + r.w {
+            if y >= 0 && y < _MAP_H && x >= 0 && x < _MAP_W {
+                _map[idx(x, y)] = _TILE_FLOOR
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+func room_center(r) (cx, cy) {
+    cx = r.x + r.w / 2
+    cy = r.y + r.h / 2
+}
+
+func connect_rooms(a, b) {
+    cxa, cya := room_center(a)
+    cxb, cyb := room_center(b)
+    // L-shaped corridor: horizontal then vertical
+    carve_h_corridor(cxa, cxb, cya)
+    carve_v_corridor(cya, cyb, cxb)
+}
+
+func carve_h_corridor(x1, x2, yy) {
+    if x1 > x2 { tmp := x1; x1 = x2; x2 = tmp }
+    x := x1
+    while x <= x2 {
+        if yy >= 0 && yy < _MAP_H && x >= 0 && x < _MAP_W {
+            if _map[idx(x, yy)] == _TILE_WALL {
+                _map[idx(x, yy)] = _TILE_FLOOR
+            }
+        }
+        x = x + 1
+    }
+}
+
+func carve_v_corridor(y1, y2, xx) {
+    if y1 > y2 { tmp := y1; y1 = y2; y2 = tmp }
+    y := y1
+    while y <= y2 {
+        if y >= 0 && y < _MAP_H && xx >= 0 && xx < _MAP_W {
+            if _map[idx(xx, y)] == _TILE_WALL {
+                _map[idx(xx, y)] = _TILE_FLOOR
+            }
+        }
+        y = y + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// COLLISION
+// ═══════════════════════════════════════════════════════════════
+
+func is_walkable(x, y) (v) {
+    v = false
+    tx := int(x)
+    ty := int(y)
+    if tx < 0 || tx >= _MAP_W || ty < 0 || ty >= _MAP_H { return }
+    v = _map[idx(tx, ty)] != _TILE_WALL
+}
+
+// Simple circle-based collision: treat player as a circle with radius
+// and check if any wall tiles in a neighboring area block the move.
+func try_move(nx, ny) {
+    radius := 0.3
+    // Check the 4 tiles around the attempted position
+    cx := int(nx)
+    cy := int(ny)
+
+    ok := true
+    check_x := cx - 1
+    while check_x <= cx + 1 {
+        check_y := cy - 1
+        while check_y <= cy + 1 {
+            if is_walkable(float(check_x), float(check_y)) == false {
+                // Wall tile — check if the circle overlaps it
+                wall_cx := float(check_x) + 0.5
+                wall_cy := float(check_y) + 0.5
+                dx := nx - wall_cx
+                dy := ny - wall_cy
+                dist := sqrt(dx * dx + dy * dy)
+                if dist < radius + 0.5 {
+                    ok = false
+                }
+            }
+            check_y = check_y + 1
+        }
+        check_x = check_x + 1
+    }
+
+    if ok {
+        _px = nx
+        _py = ny
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════════════════════
+
+func dist_shade(dist) (c) {
+    // Darken walls with distance
+    d := dist * 25.0
+    if d > 100.0 { d = 100.0 }
+    base := 100.0
+    shade := base - d
+    if shade < 20.0 { shade = 20.0 }
+    s := int(shade)
+    c = Color{s, s - 5, s - 10, 255}
+    if s < 10 { s = 10 }
+    if s - 5 < 5 { c = Color{s, s, s, 255} }
+}
+
+func render_view(cam) {
+    BeginMode3D(cam)
+
+    // Draw floor — a large flat rectangle
+    // Draw individual floor tiles as thin boxes
+    y := 0
+    while y < _MAP_H {
+        x := 0
+        while x < _MAP_W {
+            t := _map[idx(x, y)]
+            if t == _TILE_FLOOR || t == _TILE_DOOR {
+                // Floor tile
+                fx := float(x) + 0.5
+                fz := float(y) + 0.5
+                DrawCube(v3(fx, -0.05, fz), 1.0, 0.1, 1.0, _COL_FLOOR)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    // Draw walls
+    y = 0
+    while y < _MAP_H {
+        x := 0
+        while x < _MAP_W {
+            t := _map[idx(x, y)]
+            if t == _TILE_WALL {
+                wx := float(x) + 0.5
+                wz := float(y) + 0.5
+                // Distance-based shading for atmosphere
+                dx := wx - _px
+                dz := wz - _py
+                dist := sqrt(dx * dx + dz * dz)
+                wall_col := dist_shade(dist)
+                DrawCube(v3(wx, 0.5, wz), 1.0, 1.0, 1.0, wall_col)
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    EndMode3D()
+}
+
+func render_hud() {
+    // Health bar
+    DrawRectangle(20, 20, 204, 24, _COL_HP_BG)
+    hp_w := _php * 200 / _pmaxhp
+    if hp_w < 0 { hp_w = 0 }
+    DrawRectangle(22, 22, hp_w, 20, _COL_HP_FG)
+
+    // HP text
+    DrawText("HP: " + str(_php) + "/" + str(_pmaxhp), 20, 48, 14, _COL_WHITE)
+
+    // Gold
+    DrawText("Gold: " + str(_pgold), 20, 66, 14, _COL_GRAY)
+
+    // Controls hint
+    DrawText("WASD=move  Mouse=look  ESC=cursor  Q=quit", 250, 20, 14, _COL_GRAY)
+
+    // FPS
+    DrawFPS(750, 20)
+
+    // Crosshair (simple dot)
+    DrawRectangle(398, 298, 4, 4, _COL_WHITE)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// INPUT
+// ═══════════════════════════════════════════════════════════════
+
+func handle_input(dt) (running) {
+    running = 1
+    speed := dt * 3.5
+
+    // Toggle mouse capture with ESC
+    if IsKeyDown(256) {  // ESC
+        if _mouse_captured == 1 {
+            EnableCursor()
+            _mouse_captured = 0
+        } else {
+            DisableCursor()
+            _mouse_captured = 1
+        }
+    }
+
+    // Quit
+    if IsKeyDown(81) {  // Q
+        running = 0
+        return
+    }
+
+    // Mouse look (only when captured)
+    if _mouse_captured == 1 {
+        md := GetMouseDelta()
+        _pangle = _pangle - float(md.x) * dt * 3.0
+    }
+
+    // Movement (relative to camera angle)
+    forward := 0.0
+    strafe := 0.0
+
+    if IsKeyDown(87) { forward = speed }       // W
+    if IsKeyDown(83) { forward = -speed }       // S
+    if IsKeyDown(65) { strafe = -speed }        // A
+    if IsKeyDown(68) { strafe = speed }         // D
+
+    if forward != 0.0 || strafe != 0.0 {
+        nx := _px + cos(_pangle) * forward + cos(_pangle + 1.5708) * strafe
+        ny := _py + sin(_pangle) * forward + sin(_pangle + 1.5708) * strafe
+        try_move(nx, ny)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+
+func main() {
+    // Seed RNG
+    seed := rand_bytes(1)  // ignore, just for seed — rand_bytes is truly random
+
+    // Generate dungeon
+    gen_dungeon()
+
+    // Init window
+    InitWindow(800, 600, "machin-game-dungeon — Daggerfall Prototype")
+    SetTargetFPS(60)
+    DisableCursor()
+
+    // Game loop
+    while WindowShouldClose() == false {
+        dt := GetFrameTime()
+
+        // Input
+        running := handle_input(dt)
+        if running == 0 {
+            break
+        }
+
+        // Build camera
+        eye_y := 0.7
+        cam_pos := v3(_px, eye_y, _py)
+        cam_target := v3(_px + cos(_pangle), eye_y, _py + sin(_pangle))
+        cam_up := v3(0.0, 1.0, 0.0)
+        cam := Camera3D{cam_pos, cam_target, cam_up, 75.0, 0}
+
+        // Draw
+        BeginDrawing()
+        ClearBackground(Color{15, 12, 10, 255})  // dark dungeon
+
+        render_view(cam)
+        render_hud()
+
+        EndDrawing()
+    }
+
+    // Cleanup
+    EnableCursor()
+    CloseWindow()
+}
