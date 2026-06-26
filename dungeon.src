@@ -84,6 +84,19 @@ var _COL_HP_BG   = Color{60, 60, 60, 255}     // HP bar background
 var _COL_HP_FG   = Color{200, 40, 40, 255}    // HP bar fill
 var _COL_WHITE   = Color{255, 255, 255, 255}
 var _COL_GRAY    = Color{180, 180, 180, 255}
+var _COL_TORCH   = Color{255, 160, 50, 255}
+
+type Light struct {
+    x float
+    y float
+    z float
+    radius float
+    intensity float
+    r float
+    g float
+    b float
+}
+var _lights = []Light{}
 
 // ═══════════════════════════════════════════════════════════════
 // GAME STATE
@@ -261,6 +274,66 @@ func carve_v_corridor(y1, y2, xx) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// LIGHTING
+// ═══════════════════════════════════════════════════════════════
+
+func add_light(x, y, z, radius, intensity, r, g, b) {
+    _lights = append(_lights, Light{x, y, z, radius, intensity, r, g, b})
+}
+
+func place_torches() {
+    _lights = []Light{}
+    ri := 0
+    while ri < len(_rooms) {
+        r := _rooms[ri]
+        cx := float(r.x + r.w / 2) + 0.5
+        cz := float(r.y + r.h / 2) + 0.5
+        add_light(cx, 0.8, cz, 5.0, 1.2, 1.0, 0.55, 0.15)
+        if r.w * r.h > 15 {
+            add_light(cx + 1.5, 0.8, cz, 4.0, 0.8, 1.0, 0.5, 0.1)
+        }
+        ri = ri + 1
+    }
+}
+
+func calc_lighting(wx, wy, wz, px, py, pz) (lr, lg, lb) {
+    amb := 0.06
+    lr = amb; lg = amb; lb = amb
+    li := 0
+    while li < len(_lights) {
+        l := _lights[li]
+        dx := wx - l.x
+        dy := wy - l.y
+        dz := wz - l.z
+        dist := sqrt(dx*dx + dy*dy + dz*dz)
+        if dist < l.radius {
+            atten := 1.0 - dist / l.radius
+            atten = atten * atten * l.intensity
+            lr = lr + l.r * atten
+            lg = lg + l.g * atten
+            lb = lb + l.b * atten
+        }
+        li = li + 1
+    }
+    // Player lantern
+    pdx := wx - px
+    pdy := wy - py
+    pdz := wz - pz
+    pdist := sqrt(pdx*pdx + pdy*pdy + pdz*pdz)
+    pr := 4.0
+    if pdist < pr {
+        patten := 1.0 - pdist / pr
+        patten = patten * patten * 0.5
+        lr = lr + patten
+        lg = lg + patten * 0.85
+        lb = lb + patten * 0.6
+    }
+    if lr > 1.0 { lr = 1.0 }
+    if lg > 1.0 { lg = 1.0 }
+    if lb > 1.0 { lb = 1.0 }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // COLLISION
 // ═══════════════════════════════════════════════════════════════
 
@@ -311,41 +384,36 @@ func try_move(nx, ny) {
 // RENDERING
 // ═══════════════════════════════════════════════════════════════
 
-func dist_shade(dist) (c) {
-    // Darken walls with distance
-    d := dist * 25.0
-    if d > 100.0 { d = 100.0 }
-    base := 100.0
-    shade := base - d
-    if shade < 20.0 { shade = 20.0 }
-    s := int(shade)
-    c = Color{s, s - 5, s - 10, 255}
-    if s < 10 { s = 10 }
-    if s - 5 < 5 { c = Color{s, s, s, 255} }
-}
-
 func render_view(cam) {
     BeginMode3D(cam)
 
-    // Draw floor — a large flat rectangle
-    // Draw individual floor tiles as thin boxes
+    player_y := 0.7
+
+    // ── floor tiles (lit) ──
     y := 0
     while y < _MAP_H {
         x := 0
         while x < _MAP_W {
             t := _map[idx(x, y)]
             if t == _TILE_FLOOR || t == _TILE_DOOR {
-                // Floor tile
                 fx := float(x) + 0.5
                 fz := float(y) + 0.5
-                DrawCube(v3(fx, -0.05, fz), 1.0, 0.1, 1.0, _COL_FLOOR)
+                lr, lg, lb := calc_lighting(fx, -0.05, fz, _px, player_y, _py)
+                fr := lr * 45.0
+                fg := lg * 40.0
+                fb := lb * 35.0
+                if fr > 45.0 { fr = 45.0 }
+                if fg > 40.0 { fg = 40.0 }
+                if fb > 35.0 { fb = 35.0 }
+                fc := Color{int(6.0 + fr), int(4.0 + fg), int(2.0 + fb), 255}
+                DrawCube(v3(fx, -0.05, fz), 1.0, 0.1, 1.0, fc)
             }
             x = x + 1
         }
         y = y + 1
     }
 
-    // Draw walls
+    // ── walls (lit) ──
     y = 0
     while y < _MAP_H {
         x := 0
@@ -354,16 +422,38 @@ func render_view(cam) {
             if t == _TILE_WALL {
                 wx := float(x) + 0.5
                 wz := float(y) + 0.5
-                // Distance-based shading for atmosphere
-                dx := wx - _px
-                dz := wz - _py
-                dist := sqrt(dx * dx + dz * dz)
-                wall_col := dist_shade(dist)
-                DrawCube(v3(wx, 0.5, wz), 1.0, 1.0, 1.0, wall_col)
+                lr, lg, lb := calc_lighting(wx, 0.5, wz, _px, player_y, _py)
+                r := int(100.0 * lr)
+                g := int(95.0 * lg)
+                b := int(90.0 * lb)
+                if r > 255 { r = 255 }
+                if g > 255 { g = 255 }
+                if b > 255 { b = 255 }
+                if r < 8 { r = 8 }
+                if g < 8 { g = 8 }
+                if b < 8 { b = 8 }
+                DrawCube(v3(wx, 0.5, wz), 1.0, 1.0, 1.0, Color{r, g, b, 255})
             }
             x = x + 1
         }
         y = y + 1
+    }
+
+    // ── torch flames ──
+    li := 0
+    while li < len(_lights) {
+        l := _lights[li]
+        flicker := sin(float(now_ms()) * 0.004 + float(li) * 2.5) * 0.12 + 0.88
+        tr := l.r * flicker
+        tg := l.g * flicker * 0.6
+        tb := l.b * flicker * 0.1
+        if tr > 1.0 { tr = 1.0 }
+        if tg > 1.0 { tg = 1.0 }
+        if tb > 1.0 { tb = 1.0 }
+        tc := Color{int(tr * 255), int(tg * 255), int(tb * 255), 255}
+        DrawCube(v3(l.x, 0.8, l.z), 0.12, 0.15, 0.12, tc)
+        DrawCube(v3(l.x, 0.75, l.z), 0.15, 0.05, 0.15, Color{80, 60, 30, 255})
+        li = li + 1
     }
 
     EndMode3D()
@@ -449,6 +539,7 @@ func main() {
 
     // Generate dungeon
     gen_dungeon()
+    place_torches()
 
     // Init window
     InitWindow(800, 600, "machin-game-dungeon — Daggerfall Prototype")
